@@ -30,7 +30,18 @@
  *   pnpm tsx scripts/replay-checks.mts
  *   pnpm tsx scripts/replay-checks.mts --key h1-not-name    # one check, every run
  *   pnpm tsx scripts/replay-checks.mts --all-runs           # not just newest per site
+ *   pnpm tsx scripts/replay-checks.mts --fails              # every fail, with its receipt
+ *   pnpm tsx scripts/replay-checks.mts --dir <path>         # report-shaped JSON on disk
+ *
+ * `--dir` reads the `OUT=` dumps `validate-checks.mts` writes, which is how a
+ * freshly re-crawled corpus gets replayed before anything is persisted. The
+ * stored audits in the database are OLD — `metas`, `links` and `scriptSrcs` are
+ * absent from every one of them, and roughly twenty checks read those — so a
+ * replay over the database alone can only ever exercise the half of the battery
+ * that reads the fields we were already capturing.
  */
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { openDb, readDbConfig } from "../src/db/client.js";
 import { siteKey } from "../src/db/prospect-audits.js";
 import { loadCredentialsIntoEnv } from "../src/util/credentials.js";
@@ -45,6 +56,10 @@ const onlyKey = ((): string | null => {
   return i >= 0 ? (args[i + 1] ?? null) : null;
 })();
 const allRuns = args.includes("--all-runs");
+const fromDir = ((): string | null => {
+  const i = args.indexOf("--dir");
+  return i >= 0 ? (args[i + 1] ?? null) : null;
+})();
 const showFails = args.includes("--fails");
 
 const MARK: Record<CheckStatus, string> = {
@@ -70,13 +85,55 @@ function trim(s: string | null, n = 64): string {
   return one.length > n ? `${one.slice(0, n - 1)}…` : one;
 }
 
-async function main(): Promise<void> {
+type Row = {
+  id: string;
+  url: string;
+  business: string | null;
+  created_at: string;
+  result_json: string;
+};
+
+/** The `OUT=` dumps, newest first, so the newest-per-site fold behaves the same
+ *  way it does for database rows. */
+function readDir(dir: string): Row[] {
+  const files = readdirSync(dir).filter((f) => f.endsWith(".json"));
+  const rows: Row[] = [];
+  for (const f of files) {
+    const path = join(dir, f);
+    const json = readFileSync(path, "utf-8");
+    let parsed: { url?: string; business?: string | null };
+    try {
+      parsed = JSON.parse(json) as { url?: string; business?: string | null };
+    } catch {
+      console.log(`  !! ${f}: unparseable`);
+      continue;
+    }
+    rows.push({
+      id: f,
+      url: parsed.url ?? f.replace(/\.json$/, ""),
+      business: parsed.business ?? null,
+      created_at: new Date().toISOString(),
+      result_json: json,
+    });
+  }
+  return rows;
+}
+
+async function fromDatabase(): Promise<Row[]> {
   const db = await openDb(readDbConfig());
-  const rows = await db
-    .selectFrom("prospect_audits")
-    .select(["id", "url", "business", "created_at", "result_json"])
-    .orderBy("created_at", "desc")
-    .execute();
+  try {
+    return await db
+      .selectFrom("prospect_audits")
+      .select(["id", "url", "business", "created_at", "result_json"])
+      .orderBy("created_at", "desc")
+      .execute();
+  } finally {
+    await db.destroy();
+  }
+}
+
+async function main(): Promise<void> {
+  const rows: Row[] = fromDir ? readDir(fromDir) : await fromDatabase();
 
   const runs: Run[] = [];
   const unreadable: string[] = [];
@@ -123,15 +180,14 @@ async function main(): Promise<void> {
     });
   }
 
-  await db.destroy();
-
   // Newest run per site unless asked otherwise: a site audited five times would
   // otherwise weigh five times as much in every count below.
   const newestPerSite = new Map<string, Run>();
   for (const r of runs) if (!newestPerSite.has(r.site)) newestPerSite.set(r.site, r);
   const counted = allRuns ? runs : [...newestPerSite.values()];
 
-  console.log(`${rows.length} stored audits — ${runs.length} replayable, ${unreadable.length} not`);
+  const what = fromDir ? "crawls on disk" : "stored audits";
+  console.log(`${rows.length} ${what} — ${runs.length} replayable, ${unreadable.length} not`);
   console.log(
     `${newestPerSite.size} distinct sites; counting ${counted.length} run(s) (${allRuns ? "all" : "newest per site"})\n`,
   );
