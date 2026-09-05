@@ -81,3 +81,46 @@ session had committed on top, so undoing it would have destroyed real work. It
 stays. This is exactly the collision CLAUDE.md's "never commit from the main
 checkout" rule exists to prevent, and it happened by treating a shared checkout
 as a place to run a quick read-only command.
+
+## 2026-09-05 — A fleet sweep now asks which repos can take a push, instead of finding out at the end (`chore/fleet-repos`)
+
+Third time. A fleet-wide change is written, committed in every checkout, and
+only at `git push` does it emerge that some of those repositories are archived
+on GitHub and reject writes — with the work already done and the rollout short
+by however many repos it was.
+
+**What makes it recur is that archived is invisible from inside the clone.**
+`git remote -v` shows an ordinary URL. `git ls-remote` succeeds. `git fetch`
+succeeds. Only the push fails, and only after every commit exists. So the
+condition cannot be noticed while there is still time to act on it, and each
+session rediscovers it in the same place: the end.
+
+It also gets reported wrongly. Earlier today this session told the operator
+`reddoor-mailer` and `the-pointe` had "dead remotes". They do not — both remotes
+are reachable and both repos are archived, which from the inside is the same
+picture as deleted. The correction matters because the two have different
+answers: a deleted repo is gone, an archived one is a decision the operator can
+reverse.
+
+`scripts/fleet-repos.sh` answers the question up front. Three of the 39
+checkouts on the operator's machine cannot take a commit — `reddoor-mailer` and
+`the-pointe` (archived) and `rfp-analyze` (no `origin` at all) — and a sweep
+iterates `--pushable` and reports the rest rather than discovering them.
+
+Two implementation notes worth keeping. It issues **one `gh repo list` per
+owner, not one `gh repo view` per repo**: three API calls instead of thirty-nine,
+3.9s instead of ~40s, which is the difference between running it every time and
+not bothering. And it is written for **bash 3.2**, because that is what macOS
+ships as `/bin/bash` — the first draft used associative arrays and died on
+`declare: -A: invalid option`, which is exactly the kind of thing a script
+nobody runs on the operator's own machine gets wrong.
+
+One thing it surfaced that had nothing to do with archiving: the checkout
+`welcome-to-the-flower-court` is `tucksravin/invitations`. Directory name and
+repository name are not the same thing, and a sweep that assumes they are
+addresses the wrong repository. The script maps by remote.
+
+The rule is in CLAUDE.md under "Before a fleet sweep, ask which repos can
+receive a push", including the one thing a session must not do about it:
+unarchiving a repository to finish a rollout is the operator's decision, not a
+step.

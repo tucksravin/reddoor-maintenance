@@ -73,6 +73,33 @@ work:
 Individual site repos generally get **one** agent session at a time; the
 worktree rule is mandatory here in the central repo and best practice there.
 
+## Before a fleet sweep, ask which repos can receive a push
+
+```sh
+scripts/fleet-repos.sh            # table: pushable / ARCHIVED / NO-REMOTE / UNKNOWN
+scripts/fleet-repos.sh --pushable # names to iterate
+scripts/fleet-repos.sh --skipped  # what to leave alone, and why
+```
+
+Three of the 39 checkouts on the operator's machine cannot take a commit:
+`reddoor-mailer` and `the-pointe` are **archived** on GitHub, and `rfp-analyze`
+has no `origin` at all. Iterate `--pushable` and **report** the rest in the
+summary; do not discover them at push time.
+
+**An archived repo is invisible from inside its clone.** `git remote -v` shows a
+normal URL, `git ls-remote` succeeds, `git fetch` succeeds — only the push
+fails, and only after every commit has already been written. Three separate
+sessions have run a fleet-wide change to completion and then found the rollout
+short, and at least one of them reported the cause wrongly ("dead remote"),
+because from the inside an archived repo and a deleted one are the same picture.
+
+Do not unarchive a repo to finish a sweep. If a change genuinely must land in
+one, that is a decision for the operator, not a step in a rollout.
+
+Also note the script maps by REMOTE, not by directory name: the checkout
+`welcome-to-the-flower-court` is `tucksravin/invitations`. A sweep that assumes
+the two match will address the wrong repository.
+
 ## The work journal
 
 **Every working session appends a dated entry to `docs/workJournal.md`** — what
