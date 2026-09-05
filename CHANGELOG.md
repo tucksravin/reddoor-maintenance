@@ -1,5 +1,74 @@
 # @reddoorla/maintenance
 
+## 0.94.0
+
+### Minor Changes
+
+- f8741db: `Turnstile widget` is now earned by a browser. The column moves from the `function-health` audit to `form-e2e`.
+
+  `function-health` could only ever see whether `PUBLIC_TURNSTILE_SITE_KEY` was a non-empty string — `/health` never contacts Cloudflare — so it could not tell a working widget from one whose hostname is not on the widget's allowlist. That state throws `110200`, mints no token, and on a `Require Turnstile` site buckets 100% of real leads (#689).
+
+  `form-e2e` can: it already drives Chromium against each site's live contact form, and — contrary to what the docs claimed until today — it does **not** swap the sitekey, so the site's real widget renders with its real key on every nightly run. It now watches for the rejection and writes the verdict:
+
+  | observation                                       | verdict                 |
+  | ------------------------------------------------- | ----------------------- |
+  | `/health` reports no sitekey                      | `fail`                  |
+  | uncaught `110200` on the live page                | `fail`                  |
+  | mount point **and** a 2xx for Cloudflare's api.js | `pass`                  |
+  | key set, no widget on the page                    | `null` (clears)         |
+  | the sitekey is invalid, deleted or disabled       | `null` (clears)         |
+  | the probe never opened a browser                  | `null` (clears)         |
+  | the audit had no opinion at all                   | key omitted (preserves) |
+
+  `pass` means "deployed and not mis-hostnamed", not "a human can solve it" — no driven browser can establish that, since Cloudflare answers automation with `600010` regardless of configuration. The matchers are anchored on Cloudflare's own `[Cloudflare Turnstile]` prefix so a page that merely prints those six digits cannot raise a red alarm.
+
+  It is deliberately **positive evidence** on both halves. The mount point alone proves only that the env var is set — the starter server-renders that div from `{#if turnstileSiteKey}` — so `pass` also requires Cloudflare's script to have answered 2xx; and "no `110200`" alone is not enough, because a sitekey deleted or rotated at Cloudflare still serves api.js and still SSRs its mount point while minting nothing. Any other error Cloudflare raises against the sitekey therefore denies the green — the rest of `110xxx` by prefix, so a future code fails safe, plus `400020` and `400070`, because Cloudflare's table files "invalid sitekey" under both families and "sitekey disabled" only under the second. It does not raise a red: only `110200` has been measured verbatim here, and an alarm on the fleet's one gated site should not rest on an unmeasured string. That asymmetry is what makes matching a family by prefix safe: over-matching costs one empty cell for a night, under-matching costs leads.
+
+  Two properties worth stating because both are load-bearing:
+
+  - **The cron order forced the move.** `function-health` runs 08:00, the digest reads 09:23, `form-e2e` writes 10:15 — with both writing, `function-health`'s null would clear every browser verdict each morning before the red alarm ever saw one. Ownership is pinned from both sides by tests.
+  - **Absent ≠ null.** A run with no opinion omits the key and preserves the prior verdict; only a run that looked and could not tell writes null and clears the cell. Collapsing them would let a probe that cannot see Turnstile erase a real verdict.
+
+  The `testMode`-undeclared skip refreshes **no stamp** — `Form E2E OK` and `Form E2E checked at` are both left alone, because carrying a Turnstile verdict on a refreshed form stamp would make a stale form verdict look fresh to the report health gate (`auto-tick.ts` `formsEvidence`). It does write `Turnstile widget: null`, clearing the value `function-health` left in that column: the column has moved, so no other writer could ever correct it, and a legacy verdict nothing is measuring is exactly what this change exists to stop. Those sites are then honestly unverified, and `docs/runbooks/require-turnstile-rollout.md` gains the matching precondition — roll out testMode forwarding before checking `Require Turnstile`.
+
+### Patch Changes
+
+- a831939: A site's `url` is editable from the console. It was writable only at creation, and nowhere after.
+
+  `url` is the target **every** deployed audit drives — the inventory exposes it as `Site.deployedUrl`, so function-health, lighthouse, browser, domain and form-e2e all resolve against it. It was set by `ensure-site` and never again: it is not in `EDITABLE_SITE_FIELDS`, and the #643 freeze retired Airtable hand-editing. A site that moved — a rename, a staging host, a custom domain at launch — could not be corrected anywhere.
+
+  Found on `vida-legacy-foundation`, whose row points at a hostname that returns 404 while the real site is elsewhere. Any audit that ran against it was measuring nothing.
+
+  `kind: "url"` applies the same scheme allowlist the audit target itself uses, so a `file://` or `javascript:` value is rejected before the read — this value is handed to Chrome/lhci and fetched server-side. The render's allowlist-drift guard required the control too, so it is rendered first in the editor, above the contact fields.
+
+- 355ff8f: Correct two overstatements about what watches Cloudflare Turnstile. Both were written on 2026-09-04 and both claimed more coverage than exists.
+
+  - **`form-e2e` does not swap the sitekey.** `CF_TEST_SITEKEY` reaches exactly one expression — `` `testmode-${testSitekey}` `` (`form-e2e.ts:444`) — injected at `:460` as the _value_ of a hidden `cf-turnstile-response` input. Nothing writes `data-sitekey`, calls `page.route`, or uses `addInitScript`. The site's real widget renders with its real key on every nightly run, against 6 sites' live contact forms. The probe is already generating the evidence and discarding it.
+  - **The smoke suite's 110200 guard is inert in the fleet run.** `fleet-smoke` is clone-based and runs each site's own suite against a local dev server; `PUBLIC_TURNSTILE_SITE_KEY` is a Netlify variable that is not in the clone, so no widget initialises and no `TurnstileError` is thrown. The guard is right and defends a site's own CI where the key is present — it does not defend the fleet.
+
+  Net: nothing automated currently observes a production Turnstile widget on its production hostname. `docs/runbooks/turnstile-widgets.md` now says so plainly instead of implying two layers of cover.
+
+- 8ced67d: Correct the Turnstile runbook's browser check — as written it would condemn a working widget.
+
+  Two claims in `docs/runbooks/turnstile-widgets.md` step 5 were wrong, and measurement on 2026-09-04 contradicts both:
+
+  - **"`.cf-turnstile` has an `iframe` child"** — the fleet's widgets are `invisible` mode and solve without leaving one. A healthy VLF widget was measured with **zero** iframes and a valid 773-character token in the same instant. An operator following the old text would have declared a working widget broken.
+  - **"the nightly `form-e2e` probe is the automated version of this"** — it is not, though not for the reason first given. No driven browser can do it: Cloudflare answers automation with error **600010** regardless of configuration (the known-good `reddoorla.com` canary and Playwright's Chromium, headed and headless, all reported it while an ordinary Chrome window minted an accepted token).
+
+  Step 5 is now a single check — a non-empty `cf-turnstile-response` — done in an ordinary browser, with the automation limits stated. The division of labour is made explicit: **110200** does not depend on the browser being human, so the smoke suite rules out the wrong-hostname state; only the manual check establishes that the widget solves.
+
+- 141a09f: Turnstile: stop reporting a widget healthy on the strength of an env var, and add widget 3.
+
+  `Turnstile widget` in Websites was written from `/health`'s `forms.turnstile`, which is `!!PUBLIC_TURNSTILE_SITE_KEY?.trim()` — a truthiness check on a string that never contacts Cloudflare. A site deployed with the sitekey of a widget already full at Cloudflare's 10-hostname cap therefore reported `pass` while the live widget threw `110200` and minted no token; under `Require Turnstile` that buckets 100% of real leads, and the false `pass` satisfied **both** halves of the guardrail meant to catch it (the red digest item needs `"fail"`, the amber cockpit watch needs `!== "pass"`).
+
+  The mapping is now asymmetric: `false → "fail"` (no key IS proof the widget can't work), `true → null` (a key is NOT proof that it does). `null` is the cockpit's existing accept-able "can't verify" watch, so nothing new had to be built; a real `pass` has to be earned by a browser.
+
+  Two more places the same failure hid, plus capacity:
+
+  - The generated smoke suite allowlisted `/turnstile|challenges\.cloudflare/i` against `pageerror` as well as console output, so the uncaught `TurnstileError` was discarded by name. The allowlist is split: console telemetry stays allowed, an uncaught throw does not.
+  - `form-ingest.mts` now reads `TURNSTILE_SECRET_KEY_3` alongside `_KEY`/`_KEY_2`, for the new "Site Forms 3" widget — "Forms 1" is full and "Site Forms 2" had one slot left fleet-wide.
+  - New runbook `docs/runbooks/turnstile-widgets.md` covers hostname allowlisting, the two-slots-per-site rule, the launch-time custom-domain cutover, and the browser check that is the only real proof. `require-turnstile-rollout.md`'s preconditions and guardrail section are corrected to match.
+
 ## 0.93.1
 
 ### Patch Changes
